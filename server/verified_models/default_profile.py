@@ -16,6 +16,11 @@ _OPENHANDS_PROVIDER = 'openhands'
 
 
 async def get_openhands_default_model_name(db_session: AsyncSession) -> str | None:
+    from storage.lite_llm_manager import is_litellm_enabled
+
+    # OpenHands-managed models are served by the LiteLLM gateway.
+    if not await is_litellm_enabled():
+        return None
     result = await db_session.execute(
         select(StoredVerifiedModel.model_name)
         .where(
