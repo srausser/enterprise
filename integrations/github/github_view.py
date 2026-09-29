@@ -39,6 +39,7 @@ from openhands.app_server.utils.async_utils import call_sync_from_async
 from openhands.app_server.utils.logger import openhands_logger as logger
 from openhands.sdk import TextContent
 from openhands.sdk.settings import ACPAgentSettings
+from openhands.sdk.utils.paging import page_iterator
 from server.auth.constants import GITHUB_APP_CLIENT_ID, GITHUB_APP_PRIVATE_KEY
 from server.auth.token_manager import TokenManager
 from storage.org_store import OrgStore
@@ -109,7 +110,7 @@ def _parse_invocation_overrides(
     return cleaned, model, effort
 
 
-async def _resolve_model_override(model: str) -> str:
+async def _resolve_model_override(model: str, user_context: ResolverUserContext) -> str:
     model_injector = get_global_config().llm_model
     if model_injector is None:
         raise GithubInvocationError(
@@ -120,12 +121,14 @@ async def _resolve_model_override(model: str) -> str:
         provider, name = model.split('/', 1)
     else:
         provider, name = 'openhands', model
-    async with model_injector.context(InjectorState()) as model_service:
-        page = await model_service.search_llm_models(
-            query=name, provider_eq=provider, limit=100
-        )
-        if any(item.provider == provider and item.name == name for item in page.items):
-            return f'{provider}/{name}'
+    state = InjectorState()
+    setattr(state, USER_CONTEXT_ATTR, user_context)
+    async with model_injector.context(state) as model_service:
+        async for item in page_iterator(
+            model_service.search_llm_models, query=name, provider_eq=provider, limit=100
+        ):
+            if item.provider == provider and item.name == name:
+                return f'{provider}/{name}'
 
     raise GithubInvocationError(
         f'Invalid @{OH_LABEL} invocation: model {model!r} is not available. '
@@ -294,6 +297,9 @@ class GithubIssue(ResolverViewInterface):
         """Create conversation using the new V1 app conversation system."""
         logger.info('[GitHub V1]: Creating V1 conversation')
 
+        github_user_context = ResolverUserContext(
+            saas_user_auth=saas_user_auth, resolver_org_id=self.resolved_org_id
+        )
         model_override = None
         reasoning_effort = None
         if isinstance(self, GithubIssueComment):
@@ -301,10 +307,9 @@ class GithubIssue(ResolverViewInterface):
                 _parse_invocation_overrides(self.comment_body)
             )
             if model_override is not None or reasoning_effort is not None:
-                user = await ResolverUserContext(
-                    saas_user_auth=saas_user_auth,
-                    resolver_org_id=self.resolved_org_id,
-                ).get_user_info(resolve_agent_profile=True)
+                user = await github_user_context.get_user_info(
+                    resolve_agent_profile=True
+                )
                 if isinstance(user.agent_settings, ACPAgentSettings):
                     raise GithubInvocationError(
                         f'@{OH_LABEL} model= and effort= overrides are supported only '
@@ -312,7 +317,9 @@ class GithubIssue(ResolverViewInterface):
                         'and try again.'
                     )
                 if model_override is not None:
-                    model_override = await _resolve_model_override(model_override)
+                    model_override = await _resolve_model_override(
+                        model_override, github_user_context
+                    )
 
         initial_user_text = await self._get_v1_initial_user_message(jinja_env)
 
@@ -340,10 +347,6 @@ class GithubIssue(ResolverViewInterface):
             processors=[github_callback_processor],
         )
 
-        github_user_context = ResolverUserContext(
-            saas_user_auth=saas_user_auth,
-            resolver_org_id=self.resolved_org_id,
-        )
         setattr(injector_state, USER_CONTEXT_ATTR, github_user_context)
 
         async with get_app_conversation_service(

@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
@@ -9,10 +11,12 @@ from integrations.github.github_view import (
     _parse_invocation_overrides,
     _resolve_model_override,
 )
+from integrations.resolver_context import ResolverUserContext
 from openhands.app_server.config_api.default_llm_model_service import (
     DefaultLLMModelService,
 )
 from openhands.app_server.settings.settings_models import Settings
+from openhands.app_server.user.specifiy_user_context import USER_CONTEXT_ATTR
 from openhands.app_server.utils.llm import ModelsResponse
 from openhands.sdk.settings import ACPAgentSettings
 from tests.unit.test_github_view import (
@@ -102,7 +106,10 @@ class TestGithubInvocationOverrides:
             )
             assert cleaned == '@openhands Fix the failing CI job.'
             assert effort == 'xhigh'
-        assert await _resolve_model_override(invocation_model) == expected_model
+        assert (
+            await _resolve_model_override(invocation_model, MagicMock())
+            == expected_model
+        )
 
         page = await model_service.search_llm_models(limit=100)
         assert ('openhands', 'gpt-5.6-sol') in {
@@ -113,14 +120,16 @@ class TestGithubInvocationOverrides:
     @patch('integrations.github.github_view.get_global_config')
     async def test_unavailable_model_is_actionable(self, mock_get_global_config):
         model_service = AsyncMock()
-        model_service.search_llm_models = AsyncMock(return_value=MagicMock(items=[]))
+        model_service.search_llm_models = AsyncMock(
+            return_value=MagicMock(items=[], next_page_id=None)
+        )
         injector = MagicMock()
         injector.context.return_value.__aenter__ = AsyncMock(return_value=model_service)
         injector.context.return_value.__aexit__ = AsyncMock(return_value=False)
         mock_get_global_config.return_value.llm_model = injector
 
         with pytest.raises(GithubInvocationError, match='model .* is not available'):
-            await _resolve_model_override('missing-model')
+            await _resolve_model_override('missing-model', MagicMock())
 
     def _create_github_issue_comment(self, comment_body):
         fixtures = _RoutingFixtures()
@@ -239,6 +248,7 @@ class TestGithubInvocationOverrides:
             '@openhands effort=extreme Fix it.'
         )
 
+        github_issue.resolved_org_id = None
         with pytest.raises(GithubInvocationError, match='effort must be one of'):
             await github_issue._create_v1_conversation(
                 MagicMock(), MagicMock(), UUID(int=1)
@@ -275,3 +285,37 @@ class TestGithubInvocationOverrides:
             )
 
         mock_get_service.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch('integrations.github.github_view.get_global_config')
+async def test_model_lookup_preserves_resolver_context_and_searches_later_pages(
+    mock_get_global_config,
+):
+    context = ResolverUserContext(
+        saas_user_auth=MagicMock(), resolver_org_id=UUID(int=7)
+    )
+    model_service = AsyncMock()
+    model_service.search_llm_models.side_effect = [
+        MagicMock(
+            items=[SimpleNamespace(provider='openhands', name='target-preview')],
+            next_page_id='next-page',
+        ),
+        MagicMock(
+            items=[SimpleNamespace(provider='openhands', name='target')],
+            next_page_id=None,
+        ),
+    ]
+
+    @asynccontextmanager
+    async def scoped_models(state):
+        assert getattr(state, USER_CONTEXT_ATTR) is context
+        assert context.resolver_org_id == UUID(int=7)
+        yield model_service
+
+    mock_get_global_config.return_value.llm_model.context = scoped_models
+    assert await _resolve_model_override('target', context) == 'openhands/target'
+    assert [
+        call.kwargs['page_id']
+        for call in model_service.search_llm_models.await_args_list
+    ] == [None, 'next-page']
