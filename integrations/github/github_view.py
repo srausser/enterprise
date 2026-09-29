@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -27,7 +28,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationStartTaskStatus,
     ConversationTrigger,
 )
-from openhands.app_server.config import get_app_conversation_service
+from openhands.app_server.config import get_app_conversation_service, get_global_config
 from openhands.app_server.integrations.github.github_service import GithubServiceImpl
 from openhands.app_server.integrations.provider import PROVIDER_TOKEN_TYPE, ProviderType
 from openhands.app_server.integrations.service_types import Comment
@@ -37,6 +38,7 @@ from openhands.app_server.user_auth.user_auth import UserAuth
 from openhands.app_server.utils.async_utils import call_sync_from_async
 from openhands.app_server.utils.logger import openhands_logger as logger
 from openhands.sdk import TextContent
+from openhands.sdk.settings import ACPAgentSettings
 from server.auth.constants import GITHUB_APP_CLIENT_ID, GITHUB_APP_PRIVATE_KEY
 from server.auth.token_manager import TokenManager
 from storage.org_store import OrgStore
@@ -44,6 +46,91 @@ from storage.proactive_conversation_store import ProactiveConversationStore
 from storage.saas_secrets_store import SaasSecretsStore
 
 OH_LABEL, INLINE_OH_LABEL = get_oh_labels(HOST)
+
+_INVOCATION_OPTION = re.compile(r'[ \t]+(?P<name>model|effort)=(?P<value>[^\s]*)')
+_MODEL_OVERRIDE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,254}')
+_REASONING_EFFORTS = frozenset(
+    {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}
+)
+
+
+class GithubInvocationError(ValueError):
+    pass
+
+
+def _match_leading_resolver_mention(comment_body: str) -> re.Match[str] | None:
+    return re.match(
+        rf'\s*{re.escape(INLINE_OH_LABEL)}(?![\w-])',
+        comment_body,
+        re.IGNORECASE,
+    )
+
+
+def _parse_invocation_overrides(
+    comment_body: str,
+) -> tuple[str, str | None, str | None]:
+    mention = _match_leading_resolver_mention(comment_body)
+    if mention is None:
+        return comment_body, None, None
+
+    values: dict[str, str] = {}
+    option_end = mention.end()
+    while match := _INVOCATION_OPTION.match(comment_body, option_end):
+        name = match.group('name')
+        value = match.group('value')
+        if not value:
+            raise GithubInvocationError(
+                f'Invalid @{OH_LABEL} invocation: {name}= requires a value.'
+            )
+        if name in values:
+            raise GithubInvocationError(
+                f'Invalid @{OH_LABEL} invocation: {name}= may be specified only once.'
+            )
+        values[name] = value
+        option_end = match.end()
+
+    model = values.get('model')
+    if model is not None and _MODEL_OVERRIDE.fullmatch(model) is None:
+        raise GithubInvocationError(
+            f'Invalid @{OH_LABEL} invocation: model must be a non-empty model identifier '
+            'without spaces.'
+        )
+
+    effort = values.get('effort')
+    if effort is not None:
+        effort = effort.lower()
+        if effort not in _REASONING_EFFORTS:
+            allowed = ', '.join(sorted(_REASONING_EFFORTS))
+            raise GithubInvocationError(
+                f'Invalid @{OH_LABEL} invocation: effort must be one of {allowed}.'
+            )
+
+    cleaned = comment_body[: mention.end()] + comment_body[option_end:]
+    return cleaned, model, effort
+
+
+async def _resolve_model_override(model: str) -> str:
+    model_injector = get_global_config().llm_model
+    if model_injector is None:
+        raise GithubInvocationError(
+            f'Invalid @{OH_LABEL} invocation: model overrides are not configured.'
+        )
+
+    if '/' in model:
+        provider, name = model.split('/', 1)
+    else:
+        provider, name = 'openhands', model
+    async with model_injector.context(InjectorState()) as model_service:
+        page = await model_service.search_llm_models(
+            query=name, provider_eq=provider, limit=100
+        )
+        if any(item.provider == provider and item.name == name for item in page.items):
+            return f'{provider}/{name}'
+
+    raise GithubInvocationError(
+        f'Invalid @{OH_LABEL} invocation: model {model!r} is not available. '
+        'Choose a model listed in OpenHands settings.'
+    )
 
 
 async def get_user_proactive_conversation_setting(user_id: str | None) -> bool:
@@ -110,6 +197,20 @@ class GithubIssue(ResolverViewInterface):
         ) = await github_service.get_issue_or_pr_title_and_body(
             self.full_repo_name, self.issue_number
         )
+        self._clean_trigger_comment_history()
+
+    def _clean_trigger_comment_history(self) -> None:
+        if not isinstance(self, GithubIssueComment):
+            return
+        trigger_ids = {str(self.comment_id)}
+        if isinstance(self, GithubInlinePRComment):
+            trigger_ids.add(self.comment_node_id)
+        self.previous_comments = [
+            comment.model_copy(update={'body': self.comment_body})
+            if comment.id in trigger_ids
+            else comment
+            for comment in self.previous_comments
+        ]
 
     async def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
         user_instructions_template = jinja_env.get_template('issue_prompt.j2')
@@ -193,6 +294,26 @@ class GithubIssue(ResolverViewInterface):
         """Create conversation using the new V1 app conversation system."""
         logger.info('[GitHub V1]: Creating V1 conversation')
 
+        model_override = None
+        reasoning_effort = None
+        if isinstance(self, GithubIssueComment):
+            self.comment_body, model_override, reasoning_effort = (
+                _parse_invocation_overrides(self.comment_body)
+            )
+            if model_override is not None or reasoning_effort is not None:
+                user = await ResolverUserContext(
+                    saas_user_auth=saas_user_auth,
+                    resolver_org_id=self.resolved_org_id,
+                ).get_user_info(resolve_agent_profile=True)
+                if isinstance(user.agent_settings, ACPAgentSettings):
+                    raise GithubInvocationError(
+                        f'@{OH_LABEL} model= and effort= overrides are supported only '
+                        'by the native OpenHands agent. Select an OpenHands agent profile '
+                        'and try again.'
+                    )
+                if model_override is not None:
+                    model_override = await _resolve_model_override(model_override)
+
         initial_user_text = await self._get_v1_initial_user_message(jinja_env)
 
         initial_message = SendMessageRequest(
@@ -209,6 +330,8 @@ class GithubIssue(ResolverViewInterface):
             # system prompt, so we inject them into the initial user message.
             system_message_suffix=None,
             initial_message=initial_message,
+            llm_model=model_override,
+            reasoning_effort=reasoning_effort,
             selected_repository=self.full_repo_name,
             selected_branch=self._get_branch_name(),
             git_provider=ProviderType.GITHUB,
@@ -349,6 +472,7 @@ class GithubInlinePRComment(GithubPRComment):
         self.previous_comments = await github_service.get_review_thread_comments(
             self.comment_node_id, self.full_repo_name, self.issue_number
         )
+        self._clean_trigger_comment_history()
 
     async def _get_instructions(self, jinja_env: Environment) -> tuple[str, str]:
         user_instructions_template = jinja_env.get_template('pr_update_prompt.j2')

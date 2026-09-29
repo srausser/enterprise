@@ -9,6 +9,7 @@ from integrations.github.github_view import (
     GithubFactory,
     GithubFailingAction,
     GithubInlinePRComment,
+    GithubInvocationError,
     GithubIssue,
     GithubIssueComment,
     GithubPRComment,
@@ -414,6 +415,9 @@ class GithubManager(Manager[GithubViewType]):
                 )
 
                 msg_info = get_session_expired_message(user_info.username)
+
+            except GithubInvocationError as e:
+                msg_info = str(e)
 
             await self.send_message(msg_info, github_view)
 
