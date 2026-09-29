@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import logging
 import os
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from typing import Any, AsyncGenerator
 from urllib.parse import urlparse
 from uuid import UUID
@@ -10,7 +12,8 @@ import base62
 import httpx
 from fastapi import Request
 from pydantic import Field
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from openhands.agent_server.models import (
     ConversationInfo,
@@ -415,7 +418,38 @@ class RemoteSandboxService(SandboxService):
             created_by_user_id=stored_sandbox.created_by_user_id,
         )
 
+    @asynccontextmanager
+    async def _admission_service(self):
+        """Serialize admission across replicas without committing caller state.
+
+        The lock has its own connection and transaction, so service commits do
+        not release it before the runtime request and sandbox record are complete.
+        All app servers targeting the same runtime API must share this database.
+        """
+        bind = self.db_session.bind
+        if not isinstance(bind, AsyncEngine) or bind.dialect.name != 'postgresql':
+            raise RuntimeError('Runtime admission requires a PostgreSQL async engine')
+        lock_id = int.from_bytes(
+            hashlib.sha256(self.api_url.rstrip('/').encode()).digest()[:8],
+            byteorder='big',
+            signed=True,
+        )
+        async with bind.connect() as connection, connection.begin():
+            await connection.execute(
+                text('SELECT pg_advisory_xact_lock(:lock_id)'), {'lock_id': lock_id}
+            )
+            session_factory = async_sessionmaker(bind, expire_on_commit=False)
+            async with session_factory() as session:
+                yield replace(self, db_session=session)
+                await session.commit()
+
     async def start_sandbox(
+        self, sandbox_spec_id: str | None = None, sandbox_id: str | None = None
+    ) -> SandboxInfo:
+        async with self._admission_service() as service:
+            return await service._start_sandbox_once(sandbox_spec_id, sandbox_id)
+
+    async def _start_sandbox_once(
         self, sandbox_spec_id: str | None = None, sandbox_id: str | None = None
     ) -> SandboxInfo:
         """Start a new sandbox by creating a remote runtime."""
@@ -580,6 +614,10 @@ class RemoteSandboxService(SandboxService):
         )
 
     async def resume_sandbox(self, sandbox_id: str) -> bool:
+        async with self._admission_service() as service:
+            return await service._resume_sandbox_once(sandbox_id)
+
+    async def _resume_sandbox_once(self, sandbox_id: str) -> bool:
         """Resume a paused sandbox, or no-op when its runtime is already active.
 
         The runtime state is resolved BEFORE any side effect, so repeated
