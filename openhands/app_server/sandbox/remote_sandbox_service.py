@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 from urllib.parse import urlparse
@@ -20,7 +21,12 @@ from openhands.agent_server.utils import utc_now
 from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationInfo,
 )
-from openhands.app_server.errors import SandboxDeleteRetryError, SandboxError
+from openhands.app_server.errors import (
+    SandboxDeleteRetryError,
+    SandboxError,
+    SandboxStartError,
+    SandboxStartErrorCode,
+)
 from openhands.app_server.sandbox import workspace_archive
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
@@ -90,6 +96,52 @@ AGENT_SERVER_PORT = 60000
 VSCODE_PORT = 60001
 WORKER_1_PORT = 12000
 WORKER_2_PORT = 12001
+
+
+_RUNTIME_START_ERROR_PATTERNS = (
+    (
+        re.compile(
+            r'Retained workspace capacity \(\d+\) is exhausted; use the OpenHands '
+            r'UI or API to stop one explicitly selected finished sandbox, deleting '
+            r'its workspace, before retrying'
+        ),
+        SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED,
+    ),
+    (
+        re.compile(
+            r'Active runtime capacity \(\d+\) is exhausted(?: for this key)?; '
+            r'pause or stop a running sandbox before retrying'
+        ),
+        SandboxStartErrorCode.ACTIVE_CAPACITY_EXHAUSTED,
+    ),
+)
+
+
+def _runtime_start_error_payload(response: httpx.Response) -> dict[str, Any] | None:
+    if response.status_code != 400:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _classify_runtime_start_error(
+    response: httpx.Response,
+) -> SandboxStartErrorCode | None:
+    """Classify only exact, allowlisted runtime-api /start failures."""
+    payload = _runtime_start_error_payload(response)
+    if payload is None:
+        return None
+    for field in ('detail', 'error'):
+        detail = payload.get(field)
+        if not isinstance(detail, str):
+            continue
+        for pattern, error_code in _RUNTIME_START_ERROR_PATTERNS:
+            if pattern.fullmatch(detail):
+                return error_code
+    return None
 
 
 def _runtime_api_error_detail(response: httpx.Response) -> str | None:
@@ -478,6 +530,11 @@ class RemoteSandboxService(SandboxService):
 
             return self._to_sandbox_info(stored_sandbox, runtime_data)
 
+        except httpx.HTTPStatusError as e:
+            error_code = _classify_runtime_start_error(e.response)
+            if error_code is not None:
+                raise SandboxStartError(error_code) from e
+            raise SandboxError('Failed to start sandbox') from e
         except httpx.HTTPError as e:
             _logger.exception('Failed to start sandbox', stack_info=True)
             raise SandboxError('Failed to start sandbox') from e

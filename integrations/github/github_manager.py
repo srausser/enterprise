@@ -28,6 +28,7 @@ from integrations.utils import (
     get_user_not_found_message,
 )
 from integrations.v1_utils import get_saas_user_auth
+from openhands.app_server.errors import SandboxStartError, SandboxStartErrorCode
 from openhands.app_server.integrations.provider import ProviderToken, ProviderType
 from openhands.app_server.integrations.service_types import AuthenticationError
 from openhands.app_server.secrets.secrets_models import Secrets
@@ -46,6 +47,20 @@ IGNORED_GITHUB_EVENT_SENDERS = frozenset(
         'openhands-ai[bot]',
     }
 )
+
+
+_SANDBOX_START_ERROR_MESSAGES = {
+    SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED: (
+        'OpenHands retained workspace capacity is full. Use the supported '
+        'OpenHands Enterprise sandbox DELETE operation on one explicitly selected '
+        'finished sandbox; this permanently deletes that sandbox workspace. Pausing '
+        'does not free a retained slot. Then mention @openhands again.'
+    ),
+    SandboxStartErrorCode.ACTIVE_CAPACITY_EXHAUSTED: (
+        'OpenHands active sandbox capacity is full. Pause or stop a running '
+        'sandbox, then mention @openhands again.'
+    ),
+}
 
 
 class GithubManager(Manager[GithubViewType]):
@@ -414,6 +429,9 @@ class GithubManager(Manager[GithubViewType]):
                 )
 
                 msg_info = get_session_expired_message(user_info.username)
+
+            except SandboxStartError as e:
+                msg_info = _SANDBOX_START_ERROR_MESSAGES[e.error_code]
 
             await self.send_message(msg_info, github_view)
 

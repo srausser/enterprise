@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -53,6 +54,21 @@ class PermissionsError(OpenHandsError):
 
 class SandboxError(OpenHandsError):
     """Error in Sandbox."""
+
+
+class SandboxStartErrorCode(str, Enum):
+    """Stable, safe classifications for actionable sandbox start failures."""
+
+    RETAINED_CAPACITY_EXHAUSTED = 'retained_capacity_exhausted'
+    ACTIVE_CAPACITY_EXHAUSTED = 'active_capacity_exhausted'
+
+
+class SandboxStartError(SandboxError):
+    """A classified sandbox start failure whose raw detail must not escape."""
+
+    def __init__(self, error_code: SandboxStartErrorCode):
+        self.error_code = error_code
+        super().__init__(detail='Failed to start sandbox')
 
 
 class SandboxDeleteRetryError(OpenHandsError):

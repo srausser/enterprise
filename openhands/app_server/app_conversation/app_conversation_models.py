@@ -12,6 +12,7 @@ from openhands.agent_server.models import (
     TextContent,
 )
 from openhands.agent_server.utils import OpenHandsUUID, utc_now
+from openhands.app_server.errors import SandboxStartErrorCode
 from openhands.app_server.event_callback.event_callback_models import (
     EventCallbackProcessor,
 )
@@ -426,6 +427,7 @@ class AppConversationStartTask(OpenHandsModel):
     created_by_user_id: str | None
     status: AppConversationStartTaskStatus = AppConversationStartTaskStatus.WORKING
     detail: str | None = None
+    error_code: SandboxStartErrorCode | None = None
     app_conversation_id: OpenHandsUUID | None = Field(
         default=None, description='The id of the app_conversation, if READY'
     )

@@ -45,7 +45,12 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
     _resolve_title_llm_profile,
     effective_disabled_skills,
 )
-from openhands.app_server.errors import ACPProviderNotAvailableError, SandboxError
+from openhands.app_server.errors import (
+    ACPProviderNotAvailableError,
+    SandboxError,
+    SandboxStartError,
+    SandboxStartErrorCode,
+)
 from openhands.app_server.event_callback.memory_change_callback_processor import (
     MemoryChangeCallbackProcessor,
 )
@@ -459,6 +464,36 @@ class TestLiveStatusAppConversationService:
         self.service._release_daily_conversation_quota.assert_awaited_once_with(
             'user-id'
         )
+
+    @pytest.mark.asyncio
+    async def test_classified_sandbox_start_failure_is_saved_on_error_task(self):
+        self.mock_user_context.get_user_id = AsyncMock(return_value='user-id')
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.mock_user.sandbox_grouping_strategy = SandboxGroupingStrategy.NO_GROUPING
+        self.service._reserve_daily_conversation_quota = AsyncMock(return_value=False)
+        self.mock_sandbox_service.start_sandbox = AsyncMock(
+            side_effect=SandboxStartError(
+                SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED
+            )
+        )
+        self.mock_app_conversation_start_task_service.save_app_conversation_start_task = AsyncMock()
+
+        observed = [
+            (task.status, task.error_code, task.detail)
+            async for task in self.service.start_app_conversation(
+                AppConversationStartRequest()
+            )
+        ]
+
+        assert observed == [
+            (AppConversationStartTaskStatus.WORKING, None, None),
+            (
+                AppConversationStartTaskStatus.ERROR,
+                SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED,
+                'Failed to start sandbox',
+            ),
+        ]
+        self.mock_sandbox_service.start_sandbox.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reserve_daily_quota_noops_without_enterprise_modules(self):

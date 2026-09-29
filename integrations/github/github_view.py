@@ -28,6 +28,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     ConversationTrigger,
 )
 from openhands.app_server.config import get_app_conversation_service
+from openhands.app_server.errors import SandboxStartError
 from openhands.app_server.integrations.github.github_service import GithubServiceImpl
 from openhands.app_server.integrations.provider import PROVIDER_TOKEN_TYPE, ProviderType
 from openhands.app_server.integrations.service_types import Comment
@@ -231,6 +232,8 @@ class GithubIssue(ResolverViewInterface):
             ):
                 if task.status == AppConversationStartTaskStatus.ERROR:
                     logger.error(f'Failed to start V1 conversation: {task.detail}')
+                    if task.error_code is not None:
+                        raise SandboxStartError(task.error_code)
                     raise RuntimeError(
                         f'Failed to start V1 conversation: {task.detail}'
                     )

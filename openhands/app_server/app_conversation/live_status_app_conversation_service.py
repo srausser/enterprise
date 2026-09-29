@@ -70,7 +70,7 @@ from openhands.app_server.config import (
     get_event_callback_service,
     resolve_provider_llm_base_url,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartError
 from openhands.app_server.event.event_service import EventService
 from openhands.app_server.event_callback.event_callback_models import EventCallback
 from openhands.app_server.event_callback.event_callback_service import (
@@ -744,6 +744,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         except Exception as exc:
             _logger.exception('Error starting conversation', stack_info=True)
             task.status = AppConversationStartTaskStatus.ERROR
+            task.error_code = (
+                exc.error_code if isinstance(exc, SandboxStartError) else None
+            )
             task.detail = redact_text_secrets(
                 redact_api_key_literals(_exception_detail(exc))
             )

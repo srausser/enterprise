@@ -60,6 +60,7 @@ class StoredAppConversationStartTask(Base):
         Enum(AppConversationStartTaskStatus), nullable=True
     )
     detail: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
     app_conversation_id: Mapped[UUID | None] = mapped_column(nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_server_url: Mapped[str | None] = mapped_column(String, nullable=True)
