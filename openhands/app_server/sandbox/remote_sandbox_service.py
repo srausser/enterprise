@@ -456,6 +456,8 @@ class RemoteSandboxService(SandboxService):
         try:
             # Enforce sandbox limits by cleaning up old sandboxes
             await self.pause_old_sandboxes(self.max_num_sandboxes - 1)
+            # Completed remote pauses cannot be rolled back with a later refusal.
+            await self.db_session.commit()
 
             # Get sandbox spec
             user_default_spec_id = await self.user_context.get_default_sandbox_spec_id()
@@ -659,6 +661,8 @@ class RemoteSandboxService(SandboxService):
         # Enforce sandbox limits only when a real paused-to-starting transition
         # is about to happen (this fetches the runtime API's global /list).
         await self.pause_old_sandboxes(self.max_num_sandboxes - 1)
+        # Preserve cleared session keys even if the following resume fails.
+        await self.db_session.commit()
 
         try:
             response = await self._send_runtime_api_request(

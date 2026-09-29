@@ -544,7 +544,8 @@ class TestSandboxLifecycle:
             9
         )  # max_num_sandboxes - 1
         remote_sandbox_service.db_session.add.assert_called_once()
-        remote_sandbox_service.db_session.commit.assert_not_called()
+        # The task-owned service makes completed pause cleanup durable.
+        remote_sandbox_service.db_session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_start_sandbox_with_specific_spec(
@@ -3501,3 +3502,85 @@ async def test_admission_rejects_unavailable_database_before_runtime_request(
     with pytest.raises(RuntimeError, match='PostgreSQL async engine'):
         await remote_sandbox_service.start_sandbox()
     mock_httpx_client.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['start', 'resume'])
+async def test_capacity_denial_keeps_completed_pause_key_invalidation(
+    remote_sandbox_service, async_session_maker, monkeypatch, operation
+):
+    from dataclasses import replace
+
+    async with async_session_maker() as seed:
+        seed.add_all(
+            [
+                StoredSandbox(
+                    id='old',
+                    backend=REMOTE_BACKEND,
+                    created_by_user_id='test-user-123',
+                    sandbox_spec_id='test-spec',
+                    session_api_key_hash='old-key-hash',
+                ),
+                StoredSandbox(
+                    id='target',
+                    backend=REMOTE_BACKEND,
+                    created_by_user_id='test-user-123',
+                    sandbox_spec_id='test-spec',
+                ),
+            ]
+        )
+        await seed.commit()
+
+    requests = []
+    paused = False
+
+    def runtime(request):
+        nonlocal paused
+        requests.append(request.url.path)
+        if request.url.path == '/list':
+            return httpx.Response(200, json={'runtimes': [{'session_id': 'old'}]})
+        if request.url.path.startswith('/sessions/'):
+            sandbox_id = request.url.path.rsplit('/', 1)[-1]
+            return httpx.Response(
+                200,
+                json=create_runtime_data(
+                    session_id=sandbox_id,
+                    runtime_id=sandbox_id,
+                    status='paused' if sandbox_id == 'target' else 'running',
+                ),
+            )
+        if request.url.path == '/pause':
+            paused = True
+            return httpx.Response(200, json={})
+        assert request.url.path == '/' + operation
+        return httpx.Response(
+            400, json={'error': 'Retained workspace capacity is exhausted'}
+        )
+
+    monkeypatch.setattr(
+        RemoteSandboxService, '_init_environment', AsyncMock(return_value={})
+    )
+    async with (
+        async_session_maker() as session,
+        httpx.AsyncClient(transport=httpx.MockTransport(runtime)) as client,
+    ):
+        service = replace(
+            remote_sandbox_service,
+            db_session=session,
+            httpx_client=client,
+            max_num_sandboxes=1,
+        )
+        with pytest.raises(SandboxError):
+            if operation == 'start':
+                await service.start_sandbox(sandbox_id='new')
+            else:
+                await service.resume_sandbox('target')
+        async with async_session_maker() as observer:
+            old = await observer.get(StoredSandbox, 'old')
+            assert old is not None
+            assert old.session_api_key_hash is None
+            assert await observer.get(StoredSandbox, 'new') is None
+    assert paused
+    assert requests.count('/pause') == 1
+    assert requests.count('/' + operation) == 1
+    assert '/stop' not in requests
