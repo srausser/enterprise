@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
+from litellm.types.utils import Choices, ModelResponse
+from litellm.types.utils import Message as LiteLLMMessage
 from pydantic import SecretStr, ValidationError
 
 from openhands.agent_server.models import (
@@ -42,7 +44,12 @@ from openhands.app_server.app_conversation.live_status_app_conversation_service 
     _resolve_title_llm_profile,
     effective_disabled_skills,
 )
-from openhands.app_server.errors import ACPProviderNotAvailableError, SandboxError
+from openhands.app_server.errors import (
+    ACPProviderNotAvailableError,
+    SandboxError,
+    SandboxStartError,
+    SandboxStartErrorCode,
+)
 from openhands.app_server.event_callback.set_title_callback_processor import (
     SetTitleCallbackProcessor,
 )
@@ -64,7 +71,7 @@ from openhands.app_server.settings.settings_models import (
 from openhands.app_server.user.user_context import UserContext
 from openhands.app_server.utils.redis_lock import RedisLockUnavailable
 from openhands.sdk import Agent, AgentContext, Event
-from openhands.sdk.llm import LLM
+from openhands.sdk.llm import LLM, Message
 from openhands.sdk.secret import LookupSecret, StaticSecret
 from openhands.sdk.settings import (
     ACP_PROVIDERS,
@@ -449,10 +456,39 @@ class TestLiveStatusAppConversationService:
                     AppConversationStartRequest()
                 )
             ]
-
         self.service._release_daily_conversation_quota.assert_awaited_once_with(
             'user-id'
         )
+
+    @pytest.mark.asyncio
+    async def test_classified_sandbox_start_failure_is_saved_on_error_task(self):
+        self.mock_user_context.get_user_id = AsyncMock(return_value='user-id')
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.mock_user.sandbox_grouping_strategy = SandboxGroupingStrategy.NO_GROUPING
+        self.service._reserve_daily_conversation_quota = AsyncMock(return_value=False)
+        self.mock_sandbox_service.start_sandbox = AsyncMock(
+            side_effect=SandboxStartError(
+                SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED
+            )
+        )
+        self.mock_app_conversation_start_task_service.save_app_conversation_start_task = AsyncMock()
+
+        observed = [
+            (task.status, task.error_code, task.detail)
+            async for task in self.service.start_app_conversation(
+                AppConversationStartRequest()
+            )
+        ]
+
+        assert observed == [
+            (AppConversationStartTaskStatus.WORKING, None, None),
+            (
+                AppConversationStartTaskStatus.ERROR,
+                SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED,
+                'Failed to start sandbox',
+            ),
+        ]
+        self.mock_sandbox_service.start_sandbox.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reserve_daily_quota_noops_without_enterprise_modules(self):
@@ -1428,6 +1464,79 @@ class TestLiveStatusAppConversationService:
         assert llm.extended_thinking_budget is None
 
     @pytest.mark.asyncio
+    async def test_invocation_reasoning_effort_reaches_litellm_request(self):
+        user_llm = LLM(
+            model='openai/gpt-4o',
+            api_key=SecretStr('test-key'),
+            reasoning_effort='low',
+        )
+        self.mock_user.agent_settings = self.mock_user.agent_settings.model_copy(
+            update={'llm': user_llm}
+        )
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+        self.mock_user_context.get_mcp_api_key.return_value = None
+        self.service._resolve_registered_marketplaces = AsyncMock(return_value=[])
+        self.service._setup_conversation_secrets = AsyncMock(return_value=({}, None))
+        self.service._add_system_mcp_servers = AsyncMock()
+
+        with patch(
+            'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+            return_value=[],
+        ):
+            launch_request = (
+                await self.service._build_start_conversation_request_for_user(
+                    sandbox=self.mock_sandbox,
+                    conversation_id=self.conversation_id,
+                    initial_message=None,
+                    system_message_suffix=None,
+                    git_provider=ProviderType.GITHUB,
+                    working_dir='/test/dir',
+                    llm_model='openhands/gpt-5.6-sol',
+                    reasoning_effort='xhigh',
+                )
+            )
+
+        launched_llm = launch_request.agent.llm
+        response = ModelResponse(
+            id='test-response',
+            choices=[
+                Choices(
+                    message=LiteLLMMessage(role='assistant', content='done'),
+                    index=0,
+                    finish_reason='stop',
+                )
+            ],
+            created=0,
+            model='gpt-5.6-sol',
+            object='chat.completion',
+        )
+
+        request_llm = launched_llm.model_copy(update={'stream': False})
+        with (
+            patch.object(
+                LLM,
+                'aresolve_runtime_metadata',
+                new=AsyncMock(),
+            ),
+            patch(
+                'openhands.sdk.llm.llm.litellm_acompletion',
+                new=AsyncMock(return_value=response),
+            ) as completion,
+        ):
+            await request_llm.acompletion(
+                [Message(role='user', content=[TextContent(text='Fix it')])]
+            )
+
+        assert launched_llm.model == 'openhands/gpt-5.6-sol'
+        assert completion.await_args.kwargs['model'] == 'gpt-5.6-sol'
+        assert (
+            completion.await_args.kwargs['api_base'] == 'https://provider.example.com'
+        )
+        assert completion.await_args.kwargs['reasoning_effort'] == 'xhigh'
+        assert self.mock_user.agent_settings.llm.model == 'openai/gpt-4o'
+        assert self.mock_user.agent_settings.llm.reasoning_effort == 'low'
+
+    @pytest.mark.asyncio
     async def test_configure_llm_and_mcp_openhands_model_uses_user_base_url(
         self,
     ):
@@ -2064,7 +2173,7 @@ class TestLiveStatusAppConversationService:
             self.mock_user
         )
         self.service._configure_llm_and_mcp.assert_called_once_with(
-            self.mock_user, 'gpt-4', test_conversation_id
+            self.mock_user, 'gpt-4', test_conversation_id, None
         )
 
     @patch(

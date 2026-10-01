@@ -70,7 +70,7 @@ from openhands.app_server.config import (
     get_event_callback_service,
     resolve_provider_llm_base_url,
 )
-from openhands.app_server.errors import SandboxError
+from openhands.app_server.errors import SandboxError, SandboxStartError
 from openhands.app_server.event.event_service import EventService
 from openhands.app_server.event_callback.event_callback_models import EventCallback
 from openhands.app_server.event_callback.event_callback_service import (
@@ -564,6 +564,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     working_dir,
                     request.agent_type,
                     request.llm_model,
+                    request.reasoning_effort,
                     trigger=request.trigger,
                     remote_workspace=remote_workspace,
                     selected_repository=request.selected_repository,
@@ -730,6 +731,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         except Exception as exc:
             _logger.exception('Error starting conversation', stack_info=True)
             task.status = AppConversationStartTaskStatus.ERROR
+            task.error_code = (
+                exc.error_code if isinstance(exc, SandboxStartError) else None
+            )
             task.detail = redact_text_secrets(
                 redact_api_key_literals(_exception_detail(exc))
             )
@@ -1332,18 +1336,22 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         return secrets, enrichment.system_message_suffix
 
-    def _configure_llm(self, user: UserInfo, llm_model: str | None) -> LLM:
+    def _configure_llm(
+        self,
+        user: UserInfo,
+        llm_model: str | None,
+        reasoning_effort: str | None = None,
+    ) -> LLM:
         """Configure LLM settings.
 
         Starts from the user's saved LLM configuration and overrides only
-        the fields that the server needs to resolve (model name, base URL,
-        and usage ID).  All other user-configured fields (e.g.
-        ``reasoning_effort``, ``extended_thinking_budget``, ``drop_params``)
-        are preserved so that they reach the agent-server unchanged.
+        per-conversation fields. All other user-configured fields are preserved
+        so that they reach the agent-server unchanged.
 
         Args:
             user: User information containing LLM preferences
             llm_model: Optional specific model to use, falls back to user default
+            reasoning_effort: Optional effort override for this conversation
 
         Returns:
             Configured LLM instance
@@ -1360,16 +1368,17 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             provider_base_url=self.openhands_provider_base_url,
         )
 
-        return user.agent_settings.llm.model_copy(
-            update={
-                'model': model,
-                'base_url': base_url,
-                'api_key': user.agent_settings.llm.api_key,
-                'usage_id': 'agent',
-                # Force streaming on (the SDK LLM defaults stream=False).
-                'stream': True,
-            }
-        )
+        updates: dict[str, Any] = {
+            'model': model,
+            'base_url': base_url,
+            'api_key': user.agent_settings.llm.api_key,
+            'usage_id': 'agent',
+            # Force streaming on (the SDK LLM defaults stream=False).
+            'stream': True,
+        }
+        if reasoning_effort is not None:
+            updates['reasoning_effort'] = reasoning_effort
+        return user.agent_settings.llm.model_copy(update=updates)
 
     async def _maybe_refresh_managed_llm_key(self, user: UserInfo, llm: LLM) -> LLM:
         """Best-effort refresh for stale SaaS managed LiteLLM keys.
@@ -1690,7 +1699,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
 
     async def _configure_llm_and_mcp(
-        self, user: UserInfo, llm_model: str | None, conversation_id: UUID
+        self,
+        user: UserInfo,
+        llm_model: str | None,
+        conversation_id: UUID,
+        reasoning_effort: str | None = None,
     ) -> tuple[LLM, dict[str, MCPServer]]:
         """Configure LLM and MCP (Model Context Protocol) settings.
 
@@ -1698,6 +1711,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             user: User information containing LLM preferences
             llm_model: Optional specific model to use, falls back to user default
             conversation_id: Conversation ID forwarded to the OpenHands MCP server
+            reasoning_effort: Optional effort override for this conversation
 
         Returns:
             Tuple of (configured LLM instance, MCP config dict in the flat
@@ -1705,7 +1719,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             ``Agent.mcp_config`` field expects)
         """
         # Configure LLM
-        llm = self._configure_llm(user, llm_model)
+        llm = self._configure_llm(user, llm_model, reasoning_effort)
         _logger.debug(
             'managed_llm_key_refresh:configured_llm',
             extra={
@@ -2042,6 +2056,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         working_dir: str,
         agent_type: AgentType = AgentType.DEFAULT,
         llm_model: str | None = None,
+        reasoning_effort: str | None = None,
         trigger: ConversationTrigger | None = None,
         remote_workspace: AsyncRemoteWorkspace | None = None,
         selected_repository: str | None = None,
@@ -2074,6 +2089,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             working_dir: Working directory path
             agent_type: Type of agent (DEFAULT or PLAN)
             llm_model: Optional specific LLM model to use
+            reasoning_effort: Optional effort override for this conversation
             trigger: Optional conversation trigger.
             remote_workspace: Optional remote workspace instance
             selected_repository: Optional repository name
@@ -2202,7 +2218,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         # --- LLM + MCP -----------------------------------------------------
         llm, mcp_config = await self._configure_llm_and_mcp(
-            user, llm_model, conversation_id
+            user, llm_model, conversation_id, reasoning_effort
         )
 
         # --- system_message_suffix (planning-agent prefix) ------------------

@@ -13,8 +13,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from integrations.github.github_manager import GithubManager
+from integrations.github.github_view import GithubInvocationError
 from integrations.models import Message, SourceType
 from integrations.utils import HOST_URL, get_user_not_found_message
+from openhands.app_server.errors import SandboxStartError, SandboxStartErrorCode
 
 
 class TestGithubManagerUserNotFound:
@@ -163,6 +165,89 @@ class TestGithubManagerUserNotFound:
     def github_pr_message(self, github_inline_pr_comment_message):
         """Alias for github_inline_pr_comment_message for backward compatibility."""
         return github_inline_pr_comment_message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('error_code', 'expected_message'),
+        [
+            (
+                SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED,
+                'OpenHands retained workspace capacity is full. Use the supported OpenHands Enterprise sandbox DELETE operation on one explicitly selected finished sandbox; this permanently deletes that sandbox workspace. Pausing does not free a retained slot. Then mention @openhands again.',
+            ),
+            (
+                SandboxStartErrorCode.ACTIVE_CAPACITY_EXHAUSTED,
+                'OpenHands active sandbox capacity is full. Pause or stop a running sandbox, then mention @openhands again.',
+            ),
+        ],
+    )
+    @patch('integrations.github.github_manager.get_saas_user_auth')
+    @patch('integrations.github.github_manager.Auth')
+    @patch('integrations.github.github_manager.GithubIntegration')
+    async def test_start_job_posts_one_safe_classified_failure(
+        self,
+        mock_github_integration,
+        mock_auth,
+        mock_get_saas_user_auth,
+        mock_token_manager,
+        mock_data_collector,
+        error_code,
+        expected_message,
+    ):
+        mock_token_manager.get_idp_token_from_idp_user_id = AsyncMock(
+            return_value='provider-token'
+        )
+        mock_get_saas_user_auth.return_value = MagicMock()
+        mock_data_collector.save_data = AsyncMock()
+        github_view = MagicMock()
+        github_view.user_info = MagicMock(
+            username='testuser', user_id=123, keycloak_user_id='keycloak-id'
+        )
+        github_view.initialize_new_conversation = AsyncMock(return_value=MagicMock())
+        github_view.create_new_conversation = AsyncMock(
+            side_effect=SandboxStartError(error_code)
+        )
+
+        manager = GithubManager(mock_token_manager, mock_data_collector)
+        manager.send_message = AsyncMock()
+        await manager.start_job(github_view)
+
+        manager.send_message.assert_awaited_once_with(expected_message, github_view)
+        github_view.create_new_conversation.assert_awaited_once()
+
+    @patch('integrations.github.github_manager.get_saas_user_auth')
+    @patch('integrations.github.github_manager.Auth')
+    @patch('integrations.github.github_manager.GithubIntegration')
+    @pytest.mark.asyncio
+    async def test_start_job_posts_actionable_invocation_failure(
+        self,
+        mock_github_integration,
+        mock_auth,
+        mock_get_saas_user_auth,
+        mock_token_manager,
+        mock_data_collector,
+    ):
+        mock_token_manager.get_idp_token_from_idp_user_id = AsyncMock(
+            return_value='provider-token'
+        )
+        mock_get_saas_user_auth.return_value = MagicMock()
+        mock_data_collector.save_data = AsyncMock()
+        github_view = MagicMock()
+        github_view.user_info = MagicMock(
+            username='testuser', user_id=123, keycloak_user_id='keycloak-id'
+        )
+        github_view.initialize_new_conversation = AsyncMock(return_value=MagicMock())
+        message = (
+            'Invalid @openhands invocation: effort must be one of high, low, medium.'
+        )
+        github_view.create_new_conversation = AsyncMock(
+            side_effect=GithubInvocationError(message)
+        )
+
+        manager = GithubManager(mock_token_manager, mock_data_collector)
+        manager.send_message = AsyncMock()
+        await manager.start_job(github_view)
+
+        manager.send_message.assert_awaited_once_with(message, github_view)
 
     @patch('integrations.github.github_manager.Auth')
     @patch('integrations.github.github_manager.GithubIntegration')

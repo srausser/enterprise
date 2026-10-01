@@ -12,6 +12,7 @@ Activate via the environment variable::
     OH_LLM_MODEL_KIND=server.verified_models.litellm_proxy_model_router.LiteLLMProxyModelServiceInjector
 """
 
+# Runtime-source overlay qualification probe; no behavior change.
 import asyncio
 import logging
 import time

@@ -1,7 +1,7 @@
 """Add is_verified to verified_models.
 
 Revision ID: 159
-Revises: 158
+Revises: 158_private_schema_bridge
 Create Date: 2026-08-30 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = '159'
-down_revision: str | None = '158'
+down_revision: str | None = '158_private_schema_bridge'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

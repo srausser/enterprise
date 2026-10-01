@@ -44,9 +44,6 @@ FROM base AS enterprise-server
 
 WORKDIR /app
 
-# re-declare for this section
-ARG OPENHANDS_BUILD_VERSION
-
 # Datadog labels
 LABEL com.datadoghq.tags.service="deploy"
 LABEL com.datadoghq.tags.env="${DD_ENV}"
@@ -57,7 +54,6 @@ ENV OPENHANDS_USER_ID=42420
 ENV SANDBOX_LOCAL_RUNTIME_URL=http://host.docker.internal
 ENV USE_HOST_NETWORK=false
 ENV WORKSPACE_BASE=/opt/workspace_base
-ENV OPENHANDS_BUILD_VERSION=$OPENHANDS_BUILD_VERSION
 ENV SANDBOX_USER_ID=0
 ENV FILE_STORE=local
 ENV FILE_STORE_PATH=/.openhands
@@ -79,6 +75,11 @@ RUN apt-get update -y \
         perl-base \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep the derivative version after the expensive OS package layer so source
+# patches can reuse that layer while retaining the exact runtime version.
+ARG OPENHANDS_BUILD_VERSION
+ENV OPENHANDS_BUILD_VERSION=$OPENHANDS_BUILD_VERSION
 
 # Default is 1000, but OSX is often 501
 RUN sed -i 's/^UID_MIN.*/UID_MIN 499/' /etc/login.defs

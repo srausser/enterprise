@@ -19,6 +19,7 @@ from openhands.app_server.app_conversation.app_conversation_models import (
 from openhands.app_server.app_conversation.sql_app_conversation_start_task_service import (
     SQLAppConversationStartTaskService,
 )
+from openhands.app_server.errors import SandboxStartErrorCode
 
 
 @pytest.fixture
@@ -98,6 +99,28 @@ class TestSQLAppConversationStartTaskService:
         assert retrieved_task.created_by_user_id == sample_task.created_by_user_id
         assert retrieved_task.status == sample_task.status
         assert retrieved_task.request == sample_task.request
+
+    async def test_error_code_survives_save_and_new_session_reload(
+        self,
+        async_engine,
+        service: SQLAppConversationStartTaskService,
+        sample_task: AppConversationStartTask,
+    ):
+        sample_task.status = AppConversationStartTaskStatus.ERROR
+        sample_task.error_code = SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED
+        await service.save_app_conversation_start_task(sample_task)
+
+        session_maker = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+        async with session_maker() as reloaded_session:
+            reloaded_service = SQLAppConversationStartTaskService(reloaded_session)
+            reloaded = await reloaded_service.get_app_conversation_start_task(
+                sample_task.id
+            )
+
+        assert reloaded is not None
+        assert reloaded.error_code == SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED
 
     async def test_get_nonexistent_task(
         self, service: SQLAppConversationStartTaskService

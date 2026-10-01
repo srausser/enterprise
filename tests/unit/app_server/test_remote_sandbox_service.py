@@ -21,9 +21,15 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from openhands.app_server.errors import SandboxDeleteRetryError, SandboxError
+from openhands.app_server.errors import (
+    SandboxDeleteRetryError,
+    SandboxError,
+    SandboxStartError,
+    SandboxStartErrorCode,
+)
 from openhands.app_server.sandbox.remote_sandbox_service import (
     ALLOW_CORS_ORIGINS_VARIABLE,
     STATUS_MAPPING,
@@ -31,6 +37,7 @@ from openhands.app_server.sandbox.remote_sandbox_service import (
     RemoteSandboxService,
     StoredRemoteSandbox,
     _hash_session_api_key,
+    _is_exact_retained_capacity_response,
 )
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
@@ -46,6 +53,18 @@ from openhands.app_server.sandbox.sandbox_spec_models import (
 )
 from openhands.app_server.settings.settings_models import SandboxGroupingStrategy
 from openhands.app_server.user.user_context import UserContext
+
+TEST_RETAINED_RUNTIME_LIMIT = '17'
+TEST_RETAINED_CAPACITY_DETAIL = (
+    f'Retained workspace capacity ({TEST_RETAINED_RUNTIME_LIMIT}) is exhausted; '
+    'use the OpenHands UI or API to stop one explicitly selected finished '
+    'sandbox, deleting its workspace, before retrying'
+)
+
+
+@pytest.fixture(autouse=True)
+def configured_retained_runtime_limit(monkeypatch):
+    monkeypatch.setenv('MAX_RETAINED_RUNTIMES', TEST_RETAINED_RUNTIME_LIMIT)
 
 
 @pytest.fixture
@@ -80,7 +99,9 @@ def mock_httpx_client():
 @pytest.fixture
 def mock_db_session():
     """Mock database session for testing."""
-    return AsyncMock(spec=AsyncSession)
+    session = AsyncMock(spec=AsyncSession)
+    session.begin_nested = AsyncMock(return_value=AsyncMock())
+    return session
 
 
 @pytest.fixture
@@ -88,7 +109,7 @@ def remote_sandbox_service(
     mock_sandbox_spec_service, mock_user_context, mock_httpx_client, mock_db_session
 ):
     """Create RemoteSandboxService instance with mocked dependencies."""
-    return RemoteSandboxService(
+    service = RemoteSandboxService(
         sandbox_spec_service=mock_sandbox_spec_service,
         api_url='https://api.example.com',
         api_key='test-api-key',
@@ -101,6 +122,13 @@ def remote_sandbox_service(
         httpx_client=mock_httpx_client,
         db_session=mock_db_session,
     )
+
+    @asynccontextmanager
+    async def use_mock_session():
+        yield service
+
+    service._admission_service = use_mock_session
+    return service
 
 
 def _make_stream_response(
@@ -176,6 +204,24 @@ def _conflict_response(detail: str) -> MagicMock:
     return response
 
 
+def runtime_start_response(status_code: int = 400, **kwargs) -> httpx.Response:
+    return httpx.Response(
+        status_code,
+        request=httpx.Request('POST', 'https://runtime.example.com/start'),
+        **kwargs,
+    )
+
+
+def retained_capacity_error() -> SandboxStartError:
+    response = runtime_start_response(json={'error': TEST_RETAINED_CAPACITY_DETAIL})
+    status_error = httpx.HTTPStatusError(
+        'retained capacity', request=response.request, response=response
+    )
+    error = SandboxStartError(SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED)
+    error.__cause__ = status_error
+    return error
+
+
 def create_stored_sandbox(
     sandbox_id: str = 'test-sandbox-123',
     user_id: str = 'test-user-123',
@@ -220,6 +266,97 @@ class TestRemoteSandboxService:
             headers={'X-API-Key': 'test-api-key'},
             json={'test': 'data'},
         )
+
+    @pytest.mark.parametrize(
+        ('response', 'expected'),
+        [
+            (runtime_start_response(json={'error': TEST_RETAINED_CAPACITY_DETAIL}), True),
+            (
+                runtime_start_response(
+                    content=json.dumps(
+                        {'error': TEST_RETAINED_CAPACITY_DETAIL}, separators=(', ', ': ')
+                    ).encode(),
+                    headers={'content-type': 'application/json'},
+                ),
+                True,
+            ),
+            (runtime_start_response(json={'detail': TEST_RETAINED_CAPACITY_DETAIL}), False),
+            (
+                runtime_start_response(
+                    json={
+                        'error': TEST_RETAINED_CAPACITY_DETAIL,
+                        'request_id': 'extra-field',
+                    },
+                ),
+                False,
+            ),
+            (
+                runtime_start_response(
+                    json={'error': TEST_RETAINED_CAPACITY_DETAIL + '; token=secret'},
+                ),
+                False,
+            ),
+            (
+                runtime_start_response(
+                    json={'error': TEST_RETAINED_CAPACITY_DETAIL + ' '},
+                ),
+                False,
+            ),
+            (runtime_start_response(json={'error': 'unrelated bad request'}), False),
+            (runtime_start_response(content=b'not-json'), False),
+            (
+                runtime_start_response(
+                    content=(
+                        b'{"error":"token=secret","error":'
+                        + json.dumps(TEST_RETAINED_CAPACITY_DETAIL).encode()
+                        + b'}'
+                    ),
+                    headers={'content-type': 'application/json'},
+                ),
+                False,
+            ),
+            (
+                httpx.Response(
+                    400,
+                    request=httpx.Request('GET', 'https://runtime.example.com/start'),
+                    json={'error': TEST_RETAINED_CAPACITY_DETAIL},
+                ),
+                False,
+            ),
+            (
+                httpx.Response(
+                    400,
+                    request=httpx.Request('POST', 'https://runtime.example.com/list'),
+                    json={'error': TEST_RETAINED_CAPACITY_DETAIL},
+                ),
+                False,
+            ),
+            (
+                runtime_start_response(
+                    status_code=500, json={'error': TEST_RETAINED_CAPACITY_DETAIL}
+                ),
+                False,
+            ),
+        ],
+    )
+    def test_destructive_retained_capacity_trigger_is_exact(self, response, expected):
+        assert _is_exact_retained_capacity_response(response) is expected
+
+    def test_destructive_retained_capacity_trigger_rejects_nonpositive_limit(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv('MAX_RETAINED_RUNTIMES', '0')
+        response = runtime_start_response(
+            json={
+                'error': (
+                    'Retained workspace capacity (0) is exhausted; use the OpenHands '
+                    'UI or API to stop one explicitly selected finished sandbox, '
+                    'deleting its workspace, before retrying'
+                )
+            }
+        )
+
+        assert not _is_exact_retained_capacity_response(response)
 
     @pytest.mark.asyncio
     async def test_send_runtime_api_request_timeout(self, remote_sandbox_service):
@@ -538,7 +675,7 @@ class TestSandboxLifecycle:
             9
         )  # max_num_sandboxes - 1
         remote_sandbox_service.db_session.add.assert_called_once()
-        remote_sandbox_service.db_session.commit.assert_not_called()
+        remote_sandbox_service.db_session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_start_sandbox_with_specific_spec(
@@ -618,6 +755,293 @@ class TestSandboxLifecycle:
         with patch('base62.encodebytes', return_value='test-sandbox-123'):
             with pytest.raises(SandboxError, match='Failed to start sandbox'):
                 await remote_sandbox_service.start_sandbox()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('detail', 'expected_error_code'),
+        [
+            (
+                'Retained workspace capacity (6) is exhausted; use the OpenHands UI or API to stop one explicitly selected finished sandbox, deleting its workspace, before retrying',
+                'retained_capacity_exhausted',
+            ),
+            (
+                'Active runtime capacity (4) is exhausted; pause or stop a running sandbox before retrying',
+                'active_capacity_exhausted',
+            ),
+            (
+                'Active runtime capacity (2) is exhausted for this key; pause or stop a running sandbox before retrying',
+                'active_capacity_exhausted',
+            ),
+        ],
+    )
+    async def test_start_sandbox_classifies_known_capacity_response_once(
+        self, remote_sandbox_service, detail, expected_error_code
+    ):
+        requests: list[httpx.Request] = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path == '/list':
+                return httpx.Response(200, json={'runtimes': []})
+            assert request.url.path == '/start'
+            return httpx.Response(400, json={'detail': detail})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle_request)
+        ) as client:
+            remote_sandbox_service.httpx_client = client
+            remote_sandbox_service.db_session.add = MagicMock()
+            db_result = MagicMock()
+            db_result.scalars.return_value.all.return_value = []
+            remote_sandbox_service.db_session.execute.return_value = db_result
+            remote_sandbox_service.delete_sandbox = AsyncMock()
+
+            with patch('base62.encodebytes', return_value='test-sandbox-123'):
+                with pytest.raises(SandboxError) as exc_info:
+                    await remote_sandbox_service.start_sandbox()
+
+        assert getattr(exc_info.value, 'error_code', None) == expected_error_code
+        assert str(exc_info.value) == '500: Failed to start sandbox'
+        assert [request.url.path for request in requests].count('/start') == 1
+        remote_sandbox_service.delete_sandbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'response',
+        [
+            httpx.Response(400, json={'detail': 'database password: hunter2'}),
+            httpx.Response(
+                400,
+                json={
+                    'detail': 'Retained workspace capacity (6) is exhausted; use '
+                    'the OpenHands UI or API to stop one explicitly selected '
+                    'finished sandbox, deleting its workspace, before retrying; '
+                    'token=secret'
+                },
+            ),
+            httpx.Response(
+                500,
+                json={
+                    'detail': 'Active runtime capacity (4) is exhausted; pause or '
+                    'stop a running sandbox before retrying'
+                },
+            ),
+            httpx.Response(400, json={'detail': {'message': 'capacity'}}),
+            httpx.Response(400, content=b'not-json'),
+        ],
+    )
+    async def test_start_sandbox_does_not_classify_or_expose_unknown_response(
+        self, remote_sandbox_service, response
+    ):
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            if request.url.path == '/list':
+                return httpx.Response(200, json={'runtimes': []})
+            return response
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle_request)
+        ) as client:
+            remote_sandbox_service.httpx_client = client
+            remote_sandbox_service.db_session.add = MagicMock()
+            db_result = MagicMock()
+            db_result.scalars.return_value.all.return_value = []
+            remote_sandbox_service.db_session.execute.return_value = db_result
+            remote_sandbox_service.delete_sandbox = AsyncMock()
+
+            with patch('base62.encodebytes', return_value='test-sandbox-123'):
+                with pytest.raises(SandboxError) as exc_info:
+                    await remote_sandbox_service.start_sandbox()
+
+        assert getattr(exc_info.value, 'error_code', None) is None
+        assert str(exc_info.value) == '500: Failed to start sandbox'
+        remote_sandbox_service.delete_sandbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_sandbox_never_deletes_arbitrary_paused_candidate(
+        self, mock_sandbox_spec_service, mock_user_context, monkeypatch
+    ):
+        monkeypatch.setenv('MAX_RETAINED_RUNTIMES', '17')
+        retained_capacity_detail = (
+            'Retained workspace capacity (17) '
+            'is exhausted; use the OpenHands UI or API to stop one explicitly '
+            'selected finished sandbox, deleting its workspace, before retrying'
+        )
+        safe_paused = 'safe-paused'
+        fixture_statuses = {
+            safe_paused: 'paused',
+            'collision-running': 'paused',
+            'collision-error': 'paused',
+            'running': 'running',
+            'starting': 'starting',
+            'error': 'error',
+        }
+        runtimes = [
+            create_runtime_data(
+                session_id=sandbox_id,
+                runtime_id=f'runtime-{sandbox_id}',
+                status=status,
+            )
+            for sandbox_id, status in fixture_statuses.items()
+        ]
+        runtimes.extend(
+            [
+                create_runtime_data(
+                    session_id='shadow-running',
+                    runtime_id='collision-running',
+                    status='running',
+                ),
+                create_runtime_data(
+                    session_id='collision-error',
+                    runtime_id='shadow-error',
+                    status='error',
+                ),
+            ]
+        )
+        stop_calls: list[str] = []
+        start_calls = 0
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            nonlocal start_calls
+            if request.url.path == '/list':
+                if request.url.params.get('show_all') == 'true':
+                    return httpx.Response(200, json={'runtimes': runtimes})
+                active = [
+                    runtime
+                    for runtime in runtimes
+                    if runtime['status'] in {'running', 'starting'}
+                ]
+                return httpx.Response(200, json={'runtimes': active})
+            if request.url.path.startswith('/sessions/'):
+                sandbox_id = request.url.path.rsplit('/', 1)[-1]
+                runtime = next(
+                    item for item in runtimes if item['session_id'] == sandbox_id
+                )
+                return httpx.Response(200, json=runtime)
+            if request.url.path == '/stop':
+                runtime_id = json.loads(request.content)['runtime_id']
+                stop_calls.append(runtime_id)
+                next(item for item in runtimes if item['runtime_id'] == runtime_id)[
+                    'status'
+                ] = 'stopped'
+                return httpx.Response(200, json={'status': 'stopped'})
+            if request.url.path == '/start':
+                start_calls += 1
+                if not any(item['status'] == 'stopped' for item in runtimes):
+                    return httpx.Response(
+                        400, json={'error': retained_capacity_detail}
+                    )
+                payload = json.loads(request.content)
+                runtime = create_runtime_data(
+                    session_id=payload['session_id'],
+                    runtime_id='runtime-admitted',
+                    status='starting',
+                )
+                runtimes.append(runtime)
+                return httpx.Response(200, json=runtime)
+            raise AssertionError(f'unexpected request: {request.method} {request.url}')
+
+        engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+        async with engine.begin() as connection:
+            await connection.run_sync(StoredRemoteSandbox.__table__.create)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with session_factory() as session:
+                now = datetime.now(timezone.utc)
+                session.add_all(
+                    [
+                        create_stored_sandbox(
+                            sandbox_id=sandbox_id,
+                            created_at=now.replace(microsecond=index),
+                        )
+                        for index, sandbox_id in enumerate(fixture_statuses)
+                    ]
+                )
+                await session.commit()
+                session.add(create_stored_sandbox(sandbox_id='unrelated-request-state'))
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(handle_request),
+                    base_url='https://runtime.example.com',
+                ) as client:
+                    service = RemoteSandboxService(
+                        sandbox_spec_service=mock_sandbox_spec_service,
+                        api_url='https://runtime.example.com',
+                        api_key='test-api-key',
+                        web_url=None,
+                        resource_factor=1,
+                        runtime_class=None,
+                        start_sandbox_timeout=120,
+                        max_num_sandboxes=10,
+                        user_context=mock_user_context,
+                        httpx_client=client,
+                        db_session=session,
+                    )
+                    with pytest.raises(SandboxStartError) as exc_info:
+                        await service.start_sandbox(sandbox_id='admitted')
+
+                await session.rollback()
+                retained = set(
+                    (await session.scalars(select(StoredRemoteSandbox.id))).all()
+                )
+        finally:
+            await engine.dispose()
+
+        assert exc_info.value.error_code == (
+            SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED
+        )
+        assert retained == set(fixture_statuses)
+        assert 'unrelated-request-state' not in retained
+        assert stop_calls == []
+        assert start_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_postgresql_admission_lock_spans_owner_session_commit(
+        self, remote_sandbox_service
+    ):
+        events: list[str] = []
+
+        class Transaction:
+            async def __aenter__(self):
+                events.append('transaction-enter')
+
+            async def __aexit__(self, *_args):
+                events.append('transaction-exit')
+
+        class Connection:
+            def begin(self):
+                return Transaction()
+
+            async def execute(self, *_args):
+                events.append('advisory-lock')
+
+        class ConnectionContext:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_args):
+                return None
+
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = 'postgresql'
+        session.bind.connect = lambda: ConnectionContext()
+        session.commit = AsyncMock()
+        remote_sandbox_service.db_session = session
+
+        async def start_locked(_spec_id, _sandbox_id):
+            events.append('owner-write')
+            await remote_sandbox_service.db_session.commit()
+            events.append('owner-commit')
+            return MagicMock(spec=SandboxInfo)
+
+        remote_sandbox_service._start_sandbox_locked = start_locked
+        await remote_sandbox_service.start_sandbox()
+
+        assert events == [
+            'transaction-enter',
+            'advisory-lock',
+            'owner-write',
+            'owner-commit',
+            'transaction-exit',
+        ]
 
     @pytest.mark.asyncio
     async def test_start_sandbox_with_sysbox_runtime(self, remote_sandbox_service):

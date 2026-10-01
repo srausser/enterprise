@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
+import json
 import logging
 import os
-from dataclasses import dataclass
+import re
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, AsyncGenerator
 from urllib.parse import urlparse
@@ -12,8 +15,8 @@ import base62
 import httpx
 from fastapi import Request
 from pydantic import Field
-from sqlalchemy import String, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import String, func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
 from openhands.agent_server.models import (
@@ -24,7 +27,12 @@ from openhands.agent_server.utils import utc_now
 from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationInfo,
 )
-from openhands.app_server.errors import SandboxDeleteRetryError, SandboxError
+from openhands.app_server.errors import (
+    SandboxDeleteRetryError,
+    SandboxError,
+    SandboxStartError,
+    SandboxStartErrorCode,
+)
 from openhands.app_server.sandbox import workspace_archive
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
@@ -80,6 +88,114 @@ AGENT_SERVER_PORT = 60000
 VSCODE_PORT = 60001
 WORKER_1_PORT = 12000
 WORKER_2_PORT = 12001
+
+_RETAINED_RUNTIME_LIMIT_ENV = 'MAX_RETAINED_RUNTIMES'
+_RUNTIME_START_ERROR_PATTERNS = (
+    (
+        re.compile(
+            r'Retained workspace capacity \(\d+\) is exhausted; use the OpenHands '
+            r'UI or API to stop one explicitly selected finished sandbox, deleting '
+            r'its workspace, before retrying'
+        ),
+        SandboxStartErrorCode.RETAINED_CAPACITY_EXHAUSTED,
+    ),
+    (
+        re.compile(
+            r'Active runtime capacity \(\d+\) is exhausted(?: for this key)?; '
+            r'pause or stop a running sandbox before retrying'
+        ),
+        SandboxStartErrorCode.ACTIVE_CAPACITY_EXHAUSTED,
+    ),
+)
+_ADMISSION_LOCK = asyncio.Lock()
+_ADVISORY_LOCK_ID = 16901720
+
+
+def _retained_capacity_detail() -> str | None:
+    """Return the configured runtime-api retained-capacity response without a default."""
+    try:
+        retained_limit = int(os.environ[_RETAINED_RUNTIME_LIMIT_ENV])
+    except (KeyError, ValueError):
+        return None
+    if retained_limit < 1:
+        return None
+    return (
+        f'Retained workspace capacity ({retained_limit}) is exhausted; '
+        'use the OpenHands UI or API to stop one explicitly selected finished '
+        'sandbox, deleting its workspace, before retrying'
+    )
+
+
+def _runtime_start_error_payload(response: httpx.Response) -> dict[str, Any] | None:
+    if response.status_code != 400:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _is_exact_retained_capacity_response(response: httpx.Response) -> bool:
+    """Match the one runtime-api response that authorizes destructive eviction."""
+    try:
+        request = response.request
+    except RuntimeError:
+        return False
+    content_type = response.headers.get('content-type', '').partition(';')[0].lower()
+    if not (
+        response.status_code == 400
+        and request.method == 'POST'
+        and request.url.path == '/start'
+        and content_type == 'application/json'
+    ):
+        return False
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate JSON key')
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(response.content, object_pairs_hook=unique_object)
+    except (TypeError, ValueError):
+        return False
+    expected_detail = _retained_capacity_detail()
+    return expected_detail is not None and payload == {'error': expected_detail}
+
+
+def _classify_runtime_start_error(
+    response: httpx.Response,
+) -> SandboxStartErrorCode | None:
+    """Classify only exact, allowlisted runtime-api /start failures."""
+    payload = _runtime_start_error_payload(response)
+    if payload is None:
+        return None
+    for field in ('detail', 'error'):
+        detail = payload.get(field)
+        if not isinstance(detail, str):
+            continue
+        for pattern, error_code in _RUNTIME_START_ERROR_PATTERNS:
+            if pattern.fullmatch(detail):
+                return error_code
+    return None
+
+
+def _is_exact_retained_capacity_error(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, 'response', None)
+        if isinstance(
+            response, httpx.Response
+        ) and _is_exact_retained_capacity_response(response):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _hash_session_api_key(session_api_key: str) -> str:
@@ -459,7 +575,64 @@ class RemoteSandboxService(SandboxService):
             created_by_user_id=stored_sandbox.created_by_user_id,
         )
 
+    @asynccontextmanager
+    async def _lock_admission(self):
+        """Serialize start/resume while retaining the lock across service commits."""
+        bind = self.db_session.get_bind()
+        if bind.dialect.name != 'postgresql':
+            yield
+            return
+
+        async_bind = self.db_session.bind
+        if async_bind is None or not hasattr(async_bind, 'connect'):
+            raise RuntimeError('Enterprise admission database binding is unavailable')
+        async with async_bind.connect() as lock_connection:
+            async with lock_connection.begin():
+                await lock_connection.execute(
+                    text('SELECT pg_advisory_xact_lock(:lock_id)'),
+                    {'lock_id': _ADVISORY_LOCK_ID},
+                )
+                yield
+
+    @asynccontextmanager
+    async def _admission_service(self):
+        """Use a task-owned session so admission cannot commit caller state."""
+        async_bind = self.db_session.bind
+        if async_bind is None:
+            raise RuntimeError('Enterprise admission database binding is unavailable')
+        session_factory = async_sessionmaker(async_bind, expire_on_commit=False)
+        async with session_factory() as session:
+            yield replace(self, db_session=session)
+
     async def start_sandbox(
+        self, sandbox_spec_id: str | None = None, sandbox_id: str | None = None
+    ) -> SandboxInfo:
+        """Serialize admission and fail closed on retained-capacity denial."""
+        async with _ADMISSION_LOCK:
+            async with self._lock_admission():
+                async with self._admission_service() as admission_service:
+                    return await admission_service._start_sandbox_locked(
+                        sandbox_spec_id, sandbox_id
+                    )
+
+    async def _start_sandbox_locked(
+        self, sandbox_spec_id: str | None, sandbox_id: str | None
+    ) -> SandboxInfo:
+        savepoint = await self.db_session.begin_nested()
+        try:
+            started = await self._start_sandbox_once(sandbox_spec_id, sandbox_id)
+        except Exception as capacity_error:
+            await savepoint.rollback()
+            # A paused runtime alone is not evidence that its GitHub work is
+            # durable. Capacity-pressure deletion therefore fails closed; the
+            # GitHub completion reconciler owns the only automatic delete path.
+            raise capacity_error
+        else:
+            await savepoint.commit()
+            await self.db_session.commit()
+            return started
+
+    async def _start_sandbox_once(
         self, sandbox_spec_id: str | None = None, sandbox_id: str | None = None
     ) -> SandboxInfo:
         """Start a new sandbox by creating a remote runtime."""
@@ -521,6 +694,12 @@ class RemoteSandboxService(SandboxService):
 
             return self._to_sandbox_info(stored_sandbox, runtime_data)
 
+        except httpx.HTTPStatusError as e:
+            _logger.exception('Failed to start sandbox', stack_info=True)
+            error_code = _classify_runtime_start_error(e.response)
+            if error_code is not None:
+                raise SandboxStartError(error_code) from e
+            raise SandboxError('Failed to start sandbox') from e
         except httpx.HTTPError as e:
             _logger.exception('Failed to start sandbox', stack_info=True)
             raise SandboxError('Failed to start sandbox') from e
@@ -623,20 +802,15 @@ class RemoteSandboxService(SandboxService):
         )
 
     async def resume_sandbox(self, sandbox_id: str) -> bool:
-        """Resume a paused sandbox, or no-op when its runtime is already active.
+        async with _ADMISSION_LOCK:
+            async with self._lock_admission():
+                async with self._admission_service() as admission_service:
+                    resumed = await admission_service._resume_sandbox_once(sandbox_id)
+                    await admission_service.db_session.commit()
+                    return resumed
 
-        The runtime state is resolved BEFORE any side effect, so repeated
-        requests for an active runtime never trigger sandbox-limit cleanup or a
-        runtime API /resume call:
-
-        - no stored record, runtime 404, or runtime ``stopped``/unknown: return
-          False (the router answers 404: the sandbox is missing);
-        - runtime ``starting``/``running``: return True with no side effects;
-          the existing session key is neither returned nor rotated;
-        - runtime ``paused``/``error``: sandbox-limit cleanup, then /resume;
-        - runtime API 409: re-check once (``_resolve_resume_conflict``), then
-          True, False, or a structured 409 ``SandboxError``;
-        - runtime API lookup/resume failure: 502 ``SandboxError``.
+    async def _resume_sandbox_once(self, sandbox_id: str) -> bool:
+        """Resume a paused sandbox.
 
         Security: When a sandbox is resumed, the runtime-api generates a new
         session_api_key and returns it. This invalidates any previously leaked

@@ -12,6 +12,7 @@ from openhands.agent_server.models import (
     TextContent,
 )
 from openhands.agent_server.utils import OpenHandsUUID, utc_now
+from openhands.app_server.errors import SandboxStartErrorCode
 from openhands.app_server.event_callback.event_callback_models import (
     EventCallbackProcessor,
 )
@@ -304,6 +305,7 @@ class AppConversationStartRequest(OpenHandsModel):
     )
     processors: list[EventCallbackProcessor] | None = Field(default=None)
     llm_model: str | None = None
+    reasoning_effort: str | None = None
     # One-off launch override: run THIS conversation from a specific Agent
     # Profile (by id) without changing the member's active pointer. When unset,
     # the member's active_agent_profile_id is used.
@@ -426,6 +428,7 @@ class AppConversationStartTask(OpenHandsModel):
     created_by_user_id: str | None
     status: AppConversationStartTaskStatus = AppConversationStartTaskStatus.WORKING
     detail: str | None = None
+    error_code: SandboxStartErrorCode | None = None
     app_conversation_id: OpenHandsUUID | None = Field(
         default=None, description='The id of the app_conversation, if READY'
     )
