@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from openhands.app_server.app_conversation.app_conversation_models import (
@@ -13,6 +14,7 @@ from openhands.app_server.app_conversation.app_conversation_service_base import 
     AppConversationServiceBase,
 )
 from openhands.sdk.workspace.models import CommandResult
+from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
 
 class ShellWorkspace:
@@ -141,3 +143,39 @@ async def test_setup_failure_prevents_subsequent_startup_stages(tmp_path):
     ]
     service.maybe_setup_git_hooks.assert_not_called()
     service.load_and_merge_all_skills.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_actual_workspace_transport_error_has_safe_bounded_diagnostics():
+    def fail_transport(request):
+        raise httpx.ReadError('synthetic-secret:' + 'x' * 10000, request=request)
+
+    workspace = AsyncRemoteWorkspace(
+        host='http://setup-test.invalid', working_dir='/workspace'
+    )
+    workspace._client = httpx.AsyncClient(
+        base_url=workspace.host, transport=httpx.MockTransport(fail_transport)
+    )
+    try:
+        with pytest.raises(
+            RuntimeError, match='Repository setup .*could not be executed'
+        ) as error:
+            await AppConversationServiceBase.maybe_run_setup_script(
+                None, workspace, '/project'
+            )
+        assert len(str(error.value)) < 200
+        assert 'synthetic-secret' not in str(error.value)
+        assert error.value.__suppress_context__
+    finally:
+        await workspace.reset_client()
+
+
+@pytest.mark.asyncio
+async def test_setup_cancellation_propagates():
+    workspace = SimpleNamespace(
+        execute_command=AsyncMock(side_effect=asyncio.CancelledError())
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await AppConversationServiceBase.maybe_run_setup_script(
+            None, workspace, '/project'
+        )

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from litellm.types.utils import Choices, ModelResponse
 from litellm.types.utils import Message as LiteLLMMessage
@@ -3436,7 +3437,9 @@ class TestLiveStatusAppConversationService:
         self.mock_app_conversation_info_service.save_app_conversation_info = AsyncMock()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('exit_code,timed_out', [(23, False), (-1, True)])
+    @pytest.mark.parametrize(
+        'exit_code,timed_out', [(23, False), (-1, True), (None, False)]
+    )
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.AsyncRemoteWorkspace'
     )
@@ -3458,28 +3461,48 @@ class TestLiveStatusAppConversationService:
         del self.service.run_setup_scripts
         self.service.clone_or_init_git_repo = AsyncMock()
         self.service.maybe_setup_git_hooks = AsyncMock()
-        workspace = mock_remote_workspace_class.return_value
-        workspace.working_dir = '/workspace'
-        workspace.execute_command = AsyncMock(
-            return_value=CommandResult(
-                command='setup',
-                exit_code=exit_code,
-                stdout='synthetic-secret',
-                stderr='synthetic-secret',
-                timeout_occurred=timed_out,
+        if exit_code is None:
+
+            def fail_transport(request):
+                raise httpx.ReadError(
+                    'synthetic-secret:' + 'x' * 10000, request=request
+                )
+
+            workspace = AsyncRemoteWorkspace(
+                host='http://setup-test.invalid', working_dir='/workspace'
             )
-        )
+            workspace._client = httpx.AsyncClient(
+                base_url=workspace.host, transport=httpx.MockTransport(fail_transport)
+            )
+            mock_remote_workspace_class.return_value = workspace
+        else:
+            workspace = mock_remote_workspace_class.return_value
+            workspace.working_dir = '/workspace'
+            workspace.execute_command = AsyncMock(
+                return_value=CommandResult(
+                    command='setup',
+                    exit_code=exit_code,
+                    stdout='synthetic-secret',
+                    stderr='synthetic-secret',
+                    timeout_occurred=timed_out,
+                )
+            )
 
         statuses = []
-        async for task in self.service._start_app_conversation(
-            AppConversationStartRequest()
-        ):
-            statuses.append(task.status)
+        try:
+            async for task in self.service._start_app_conversation(
+                AppConversationStartRequest()
+            ):
+                statuses.append(task.status)
+        finally:
+            if exit_code is None:
+                await workspace.reset_client()
 
         assert AppConversationStartTaskStatus.RUNNING_SETUP_SCRIPT in statuses
         assert statuses[-1] == AppConversationStartTaskStatus.ERROR
         assert 'Repository setup' in task.detail
         assert 'synthetic-secret' not in task.detail
+        assert len(task.detail) < 200
         assert AppConversationStartTaskStatus.STARTING_CONVERSATION not in statuses
         self.service.maybe_setup_git_hooks.assert_not_called()
         self.service._build_start_conversation_request_for_user.assert_not_called()

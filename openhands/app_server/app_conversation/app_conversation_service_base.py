@@ -784,12 +784,20 @@ printf 'password=%s\\n' "$token"
         # Bash is explicit: repository hooks may use Bash syntax and need not
         # be executable. Quote the path and treat only an absent hook as a no-op.
         quoted_script = shlex.quote(setup_script)
-        result = await workspace.execute_command(
-            f'if [ -e {quoted_script} ] || [ -L {quoted_script} ]; then '
-            f'bash -- {quoted_script}; fi',
-            cwd=project_dir,
-            timeout=600,
-        )
+        try:
+            result = await workspace.execute_command(
+                f'if [ -e {quoted_script} ] || [ -L {quoted_script} ]; then '
+                f'bash -- {quoted_script}; fi',
+                cwd=project_dir,
+                timeout=600,
+            )
+        except Exception:
+            # Transport errors can escape the SDK command-result handler.
+            # Suppress their context as well: exception text may contain secrets.
+            raise RuntimeError(
+                'Repository setup (.openhands/setup.sh) could not be executed; '
+                'agent startup was stopped.'
+            ) from None
         # Do not expose hook output: it can contain repository/user secrets.
         # Raising here keeps the existing start-task ERROR lifecycle and stops
         # conversation creation before the agent receives the initial task.
