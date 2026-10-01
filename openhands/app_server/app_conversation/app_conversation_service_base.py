@@ -781,11 +781,28 @@ printf 'password=%s\\n' "$token"
         """
         setup_script = project_dir + '/.openhands/setup.sh'
 
-        await workspace.execute_command(
-            f'chmod +x {setup_script} && source {setup_script}',
+        # Bash is explicit: repository hooks may use Bash syntax and need not
+        # be executable. Quote the path and treat only an absent hook as a no-op.
+        quoted_script = shlex.quote(setup_script)
+        result = await workspace.execute_command(
+            f'if [ -e {quoted_script} ] || [ -L {quoted_script} ]; then '
+            f'bash -- {quoted_script}; fi',
             cwd=project_dir,
             timeout=600,
         )
+        # Do not expose hook output: it can contain repository/user secrets.
+        # Raising here keeps the existing start-task ERROR lifecycle and stops
+        # conversation creation before the agent receives the initial task.
+        if result.timeout_occurred:
+            raise RuntimeError(
+                'Repository setup (.openhands/setup.sh) timed out after 600 seconds; '
+                'agent startup was stopped.'
+            )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                'Repository setup (.openhands/setup.sh) failed '
+                f'(exit code {result.exit_code}); agent startup was stopped.'
+            )
 
     async def maybe_setup_git_hooks(
         self,

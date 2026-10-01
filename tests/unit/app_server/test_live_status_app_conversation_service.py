@@ -78,6 +78,7 @@ from openhands.sdk.settings import (
     ConversationSettings,
     OpenHandsAgentSettings,
 )
+from openhands.sdk.workspace.models import CommandResult
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
 
@@ -3433,6 +3434,57 @@ class TestLiveStatusAppConversationService:
         self.mock_event_callback_service.save_event_callback = AsyncMock()
 
         self.mock_app_conversation_info_service.save_app_conversation_info = AsyncMock()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exit_code,timed_out', [(23, False), (-1, True)])
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.AsyncRemoteWorkspace'
+    )
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.ConversationInfo'
+    )
+    async def test_repository_setup_failure_marks_start_error_before_agent_creation(
+        self,
+        mock_conversation_info_class,
+        mock_remote_workspace_class,
+        exit_code,
+        timed_out,
+    ):
+        self._arrange_start_app_conversation(
+            uuid4(), mock_conversation_info_class, mock_remote_workspace_class
+        )
+        # Restore the real setup pipeline: only repository clone and the remote
+        # command transport are mocked. The hook result must reach task ERROR.
+        del self.service.run_setup_scripts
+        self.service.clone_or_init_git_repo = AsyncMock()
+        self.service.maybe_setup_git_hooks = AsyncMock()
+        workspace = mock_remote_workspace_class.return_value
+        workspace.working_dir = '/workspace'
+        workspace.execute_command = AsyncMock(
+            return_value=CommandResult(
+                command='setup',
+                exit_code=exit_code,
+                stdout='synthetic-secret',
+                stderr='synthetic-secret',
+                timeout_occurred=timed_out,
+            )
+        )
+
+        statuses = []
+        async for task in self.service._start_app_conversation(
+            AppConversationStartRequest()
+        ):
+            statuses.append(task.status)
+
+        assert AppConversationStartTaskStatus.RUNNING_SETUP_SCRIPT in statuses
+        assert statuses[-1] == AppConversationStartTaskStatus.ERROR
+        assert 'Repository setup' in task.detail
+        assert 'synthetic-secret' not in task.detail
+        assert AppConversationStartTaskStatus.STARTING_CONVERSATION not in statuses
+        self.service.maybe_setup_git_hooks.assert_not_called()
+        self.service._build_start_conversation_request_for_user.assert_not_called()
+        self.mock_httpx_client.post.assert_not_called()
+        self.mock_app_conversation_info_service.save_app_conversation_info.assert_not_called()
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.AsyncRemoteWorkspace'
